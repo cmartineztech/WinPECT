@@ -1,0 +1,6 @@
+.codegraph/
+Test-LiteDeploy-*-Transfers.ps1
+LiteDeploy-WinPE-Credential.ps1
+LiteDeploy-FullOS-Credential.ps1
+WinPECredentialTransfer.POC.ps1
+WinPECredentialTransfer.POC.psm1
