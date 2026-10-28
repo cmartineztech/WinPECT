@@ -162,6 +162,8 @@ try {
     Assert-WPCTTest (Test-Path -LiteralPath $packagePath -PathType Leaf) 'Encrypted package exists'
     Assert-WPCTTest (Test-Path -Path $registryPath) 'Bootstrap registry key exists'
     Assert-WPCTTest (Test-WPCTRegistryAcl $registryPath) 'Registry ACL allows only SYSTEM and Administrators'
+    Assert-WPCTTest (Test-WPCTRegistryAcl (Split-Path -Parent $registryPath)) 'Newly created parent registry key ACL allows only SYSTEM and Administrators'
+    Assert-WPCTTest ((Get-Acl -LiteralPath $testRoot).AreAccessRulesProtected) 'Newly created package parent directory ACL inheritance is disabled'
     Assert-WPCTTest (-not [string]::IsNullOrWhiteSpace($createResult.Payload.TransferId)) 'Creation returns a transfer ID'
     Assert-WPCTTest ($createResult.Payload.EngineVersion -eq $script:WPCTEngineVersion) 'Creation returns the engine version'
     Assert-WPCTTest (
@@ -370,9 +372,15 @@ try {
     Assert-WPCTTest (
         [guid]$replacementReadResult.Payload.TransferId -eq $replacementTransferId
     ) 'Replacement package and registry transfer IDs match'
-    foreach ($secret in @($replacementReadResult.Payload.Secrets)) {
-        $secret.Password = $null
-    }
+    Assert-WPCTTest (
+        $replacementReadResult.Payload.Secrets[0].Credential -is [Management.Automation.PSCredential] -and
+        $replacementReadResult.Payload.Secrets[0].SecurePassword -is [Security.SecureString]
+    ) 'Read-WPCTCredentialTransfer attaches SecurePassword and PSCredential objects'
+    Clear-WPCTPayloadSecrets -Payload $replacementReadResult.Payload
+    Assert-WPCTTest (
+        $null -eq $replacementReadResult.Payload.Secrets[0].Password -and
+        $null -eq $replacementReadResult.Payload.Secrets[0].Credential
+    ) 'Clear-WPCTPayloadSecrets scrubs payload secrets in memory'
 
     $replacementSuffix = $replacementTransferId.ToString('N')
     $packageBackupPath = '{0}.{1}.bak' -f $packagePath, $replacementSuffix

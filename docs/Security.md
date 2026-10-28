@@ -84,14 +84,18 @@ replace the random bootstrap secret or registry ACLs.
 
 ## Registry ACL
 
-The bootstrap key:
+The bootstrap key (and any parent subkeys under `SOFTWARE` created by `WinPECT`):
 
 - Disables inherited access rules.
-- Grants full control to `NT AUTHORITY\SYSTEM`.
-- Grants full control to local `Administrators`.
-- Sets local `Administrators` as owner.
+- Grants full control to `NT AUTHORITY\SYSTEM` (`S-1-5-18`).
+- Grants full control to local `Administrators` (`S-1-5-32-544`).
+- Applies the hardened DACL first and sets local `Administrators` as owner on a best-effort basis so elevated split-token administrators without `SeRestorePrivilege` still lock down the DACL.
 
-The full-OS integration test verifies these rules.
+## Logging and Memory Hygiene
+
+- `Assert-WPCTSafeLogging` blocks credential creation, reading, export, and import when PowerShell Transcription or Script Block Logging policies (including `WOW6432Node`) or `$global:Transcript` are active.
+- `ConvertTo-WPCTSerializableSecrets` extracts `PSCredential` secrets via `Marshal::SecureStringToBSTR` and zeroes the unmanaged BSTR in `finally` via `Marshal::ZeroFreeBSTR`.
+- `Read-WPCTCredentialTransfer` attaches `SecurePassword` (`SecureString`) and `Credential` (`PSCredential`) properties to each secret entry, and `Clear-WPCTPayloadSecrets` deterministically scrubs `.Password`, `.SecurePassword`, and `.Credential` in `finally`.
 
 ## Artifact sensitivity
 
