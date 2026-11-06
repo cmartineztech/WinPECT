@@ -187,6 +187,8 @@ normally do not need them directly:
 - `Assert-WPCTPathHasNoReparsePoint`
 - `Read-WPCTBoundedFile`
 - `Clear-WPCTByteArray`
+- `Clear-WPCTPayloadSecrets`
+- `Assert-WPCTSafeLogging`
 - `Test-WPCTRegistryTransferMarker`
 - `New-WPCTRandomBytes`
 - `Test-WPCTFixedTimeEquals`

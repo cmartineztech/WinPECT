@@ -96,7 +96,47 @@ foreach ($case in $cases) {
 }
 
 Assert-True ($null-eq(ConvertTo-WPCTNormalizedHardwareValue 'To Be Filled By O.E.M.' SerialNumber)) 'Placeholder serial omitted'
+Assert-True ($null-eq(ConvertTo-WPCTNormalizedHardwareValue 'Not Applicable' SerialNumber)) 'Not Applicable serial omitted'
+Assert-True ($null-eq(ConvertTo-WPCTNormalizedHardwareValue 'Invalid' SerialNumber)) 'Invalid serial omitted'
+Assert-True ($null-eq(ConvertTo-WPCTNormalizedHardwareValue '0123456789' SerialNumber)) '0123456789 serial omitted'
+Assert-True ($null-eq(ConvertTo-WPCTNormalizedHardwareValue '123456789' SerialNumber)) '123456789 serial omitted'
 Assert-True ($null-eq(ConvertTo-WPCTNormalizedHardwareValue '00000000-0000-0000-0000-000000000000' SmbiosUuid)) 'Zero UUID omitted'
+Assert-True ($null-eq(ConvertTo-WPCTNormalizedHardwareValue '03000200-0400-0500-0006-000700080009' SmbiosUuid)) 'AMI default UUID 03000200 omitted'
+Assert-True ($null-eq(ConvertTo-WPCTNormalizedHardwareValue '00020003-0004-0005-0006-000700080009' SmbiosUuid)) 'AMI byte-swapped UUID 00020003 omitted'
+Assert-True ($null-eq(ConvertTo-WPCTNormalizedHardwareValue '{03000200-0400-0500-0006-000700080009}' SmbiosUuid)) 'Braced AMI default UUID omitted'
+
+$identityCmd = Get-Command Get-WPCTMachineIdentity
+Assert-True ($null -ne $identityCmd.Parameters['MaxAttempts'] -and $null -ne $identityCmd.Parameters['RetryDelayMilliseconds']) 'Get-WPCTMachineIdentity exposes WMI retry parameters'
+
+$global:Transcript = 'C:\Temp\wpct-transcript.log'
+try {
+    $transcriptBlocked = $false
+    try {
+        Assert-WPCTSafeLogging | Out-Null
+    }
+    catch {
+        $transcriptBlocked = $true
+    }
+    Assert-True $transcriptBlocked 'Assert-WPCTSafeLogging blocks active PowerShell transcript'
+    Assert-True (Assert-WPCTSafeLogging -AllowUnsafeLogging) 'Assert-WPCTSafeLogging allows explicit test override'
+}
+finally {
+    Remove-Variable -Name Transcript -Scope Global -ErrorAction SilentlyContinue
+}
+
+$bstrTestSecure = ConvertTo-SecureString 'BstrMarshalSecret!' -AsPlainText -Force
+$bstrTestCred = New-Object Management.Automation.PSCredential('CONTOSO\bstruser', $bstrTestSecure)
+$bstrSerialized = @(ConvertTo-WPCTSerializableSecrets @(
+    [pscustomobject]@{
+        Id         = 'BstrSecret'
+        Credential = $bstrTestCred
+    }
+))
+Assert-True ($bstrSerialized.Count -eq 1 -and $bstrSerialized[0].Password -eq 'BstrMarshalSecret!') 'BSTR credential serialization round-trips password'
+$bstrSerialized[0] | Add-Member -NotePropertyName 'SecurePassword' -NotePropertyValue $bstrTestSecure -Force
+$bstrSerialized[0] | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $bstrTestCred -Force
+Clear-WPCTPayloadSecrets -Payload $bstrSerialized
+Assert-True ($null -eq $bstrSerialized[0].Password -and $null -eq $bstrSerialized[0].SecurePassword -and $null -eq $bstrSerialized[0].Credential) 'Clear-WPCTPayloadSecrets scrubs Password, SecurePassword, and Credential'
 
 $validRegistrySubKey = Resolve-WPCTRegistrySubKey 'Company\CredentialTransfer'
 Assert-True (

@@ -212,6 +212,103 @@ function Clear-WPCTByteArray {
     }
 }
 
+function Clear-WPCTPayloadSecrets {
+    <# Scrubs plaintext Password and optionally SecurePassword/Credential properties from a deserialized WPCT payload or secret array. #>
+    [CmdletBinding()]
+    param(
+        [AllowNull()][object]$Payload,
+        [switch]$KeepCredentials
+    )
+
+    if ($null -eq $Payload) {
+        return
+    }
+
+    $secretsList = if ($null -ne $Payload.PSObject.Properties['Secrets']) {
+        @($Payload.Secrets)
+    }
+    elseif ($Payload -is [System.Collections.IEnumerable]) {
+        @($Payload)
+    }
+    else {
+        @($Payload)
+    }
+
+    foreach ($secret in $secretsList) {
+        if ($null -eq $secret) {
+            continue
+        }
+        if ($null -ne $secret.PSObject.Properties['Password']) {
+            $secret.Password = $null
+        }
+        if (-not $KeepCredentials) {
+            if (
+                $null -ne $secret.PSObject.Properties['SecurePassword'] -and
+                $null -ne $secret.SecurePassword
+            ) {
+                if ($secret.SecurePassword -is [System.IDisposable]) {
+                    $secret.SecurePassword.Dispose()
+                }
+                $secret.SecurePassword = $null
+            }
+            if ($null -ne $secret.PSObject.Properties['Credential']) {
+                $secret.Credential = $null
+            }
+        }
+    }
+}
+
+function Assert-WPCTSafeLogging {
+    <# Blocks credential creation, decryption, and export when PowerShell transcription or script block logging is active. #>
+    [CmdletBinding()]
+    param([switch]$AllowUnsafeLogging)
+
+    if ($AllowUnsafeLogging) {
+        return $true
+    }
+
+    $transcriptionPaths = @(
+        'HKLM:\Software\Policies\Microsoft\Windows\PowerShell\Transcription',
+        'HKCU:\Software\Policies\Microsoft\Windows\PowerShell\Transcription',
+        'HKLM:\Software\WOW6432Node\Policies\Microsoft\Windows\PowerShell\Transcription',
+        'HKCU:\Software\WOW6432Node\Policies\Microsoft\Windows\PowerShell\Transcription'
+    )
+    foreach ($path in $transcriptionPaths) {
+        $policy = Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue
+        if (
+            $null -ne $policy -and
+            ($policy.PSObject.Properties.Name -contains 'EnableTranscripting') -and
+            [int]$policy.EnableTranscripting -eq 1
+        ) {
+            throw "PowerShell transcription policy is enabled at '$path'. WinPECT secret operations are blocked."
+        }
+    }
+
+    $scriptBlockPaths = @(
+        'HKLM:\Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging',
+        'HKCU:\Software\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging',
+        'HKLM:\Software\WOW6432Node\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging',
+        'HKCU:\Software\WOW6432Node\Policies\Microsoft\Windows\PowerShell\ScriptBlockLogging'
+    )
+    foreach ($path in $scriptBlockPaths) {
+        $sbPolicy = Get-ItemProperty -LiteralPath $path -ErrorAction SilentlyContinue
+        if ($null -ne $sbPolicy) {
+            $sbEnabled = ($sbPolicy.PSObject.Properties.Name -contains 'EnableScriptBlockLogging') -and ([int]$sbPolicy.EnableScriptBlockLogging -eq 1)
+            $sbInvocationEnabled = ($sbPolicy.PSObject.Properties.Name -contains 'EnableScriptBlockInvocationLogging') -and ([int]$sbPolicy.EnableScriptBlockInvocationLogging -eq 1)
+            if ($sbEnabled -or $sbInvocationEnabled) {
+                throw "PowerShell script block logging policy is enabled at '$path'. WinPECT secret operations are blocked."
+            }
+        }
+    }
+
+    $tVar = Get-Variable -Name Transcript -Scope Global -ErrorAction SilentlyContinue
+    if ($null -ne $tVar -and $tVar.Value) {
+        throw 'An active PowerShell transcript indicator was detected. Stop transcription before running WinPECT secret operations.'
+    }
+
+    return $true
+}
+
 function Test-WPCTRegistryOwnership {
     param(
         [Parameter(Mandatory = $true)][string]$RegistryPath,
@@ -300,43 +397,100 @@ function Test-WPCTFixedTimeEquals {
 
 function ConvertTo-WPCTNormalizedHardwareValue {
     [CmdletBinding()]
-    param([AllowNull()][object]$Value,[Parameter(Mandatory=$true)][ValidateSet('SmbiosUuid','SerialNumber')][string]$Type)
-    if($null-eq $Value){return $null}
-    $v=([string]$Value).Trim().ToUpperInvariant()
-    if([string]::IsNullOrWhiteSpace($v)){return $null}
-    $invalid=@('UNKNOWN','NONE','N/A','NA','NULL','DEFAULT STRING','TO BE FILLED BY O.E.M.','TO BE FILLED BY OEM','SYSTEM SERIAL NUMBER','NO SERIAL NUMBER','NOT SPECIFIED','NOT AVAILABLE')
-    if($invalid-contains $v){return $null}
-    if($Type-eq 'SmbiosUuid'){
-        if($v-eq '00000000-0000-0000-0000-000000000000'-or$v-eq 'FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF'){return $null}
-        [guid]$g=[guid]::Empty
-        if(-not [guid]::TryParse($v,[ref]$g)){return $null}
-        return $g.ToString('D').ToUpperInvariant()
+    param(
+        [AllowNull()][object]$Value,
+        [Parameter(Mandatory = $true)][ValidateSet('SmbiosUuid', 'SerialNumber')][string]$Type
+    )
+    if ($null -eq $Value) { return $null }
+    $v = ([string]$Value).Trim().ToUpperInvariant()
+    if ([string]::IsNullOrWhiteSpace($v)) { return $null }
+    $invalid = @(
+        'UNKNOWN',
+        'NONE',
+        'N/A',
+        'NA',
+        'NULL',
+        'DEFAULT STRING',
+        'TO BE FILLED BY O.E.M.',
+        'TO BE FILLED BY OEM',
+        'SYSTEM SERIAL NUMBER',
+        'NO SERIAL NUMBER',
+        'NOT SPECIFIED',
+        'NOT AVAILABLE',
+        'NOT APPLICABLE',
+        'INVALID',
+        '0123456789',
+        '123456789',
+        '03000200-0400-0500-0006-000700080009',
+        '00020003-0004-0005-0006-000700080009'
+    )
+    if ($invalid -contains $v) { return $null }
+    if ($Type -eq 'SmbiosUuid') {
+        $invalidUuids = @(
+            '00000000-0000-0000-0000-000000000000',
+            'FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF',
+            '03000200-0400-0500-0006-000700080009',
+            '00020003-0004-0005-0006-000700080009'
+        )
+        if ($invalidUuids -contains $v) { return $null }
+        [guid]$g = [guid]::Empty
+        if (-not [guid]::TryParse($v, [ref]$g)) { return $null }
+        $normalizedUuid = $g.ToString('D').ToUpperInvariant()
+        if ($invalidUuids -contains $normalizedUuid) { return $null }
+        return $normalizedUuid
     }
     return $v
 }
 
 function Get-WPCTMachineIdentity {
     [CmdletBinding()]
-    param()
+    param(
+        [ValidateRange(1, 10)][int]$MaxAttempts = 3,
+        [ValidateRange(0, 5000)][int]$RetryDelayMilliseconds = 300
+    )
 
     $serial = $null
     $uuid = $null
 
-    try {
-        $bios = Get-CimInstance Win32_BIOS -ErrorAction Stop | Select-Object -First 1
-        $serial = ConvertTo-WPCTNormalizedHardwareValue -Value $bios.SerialNumber -Type SerialNumber
-    }
-    catch {
-        Write-Verbose "BIOS serial number is unavailable: $($_.Exception.Message)"
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $bios = Get-CimInstance Win32_BIOS -ErrorAction Stop | Select-Object -First 1
+            if ($null -ne $bios) {
+                $serial = ConvertTo-WPCTNormalizedHardwareValue -Value $bios.SerialNumber -Type SerialNumber
+            }
+            break
+        }
+        catch {
+            if ($attempt -lt $MaxAttempts) {
+                if ($RetryDelayMilliseconds -gt 0) {
+                    Start-Sleep -Milliseconds $RetryDelayMilliseconds
+                }
+            }
+            else {
+                Write-Verbose "BIOS serial number is unavailable after $MaxAttempts attempts: $($_.Exception.Message)"
+            }
+        }
     }
 
-    try {
-        $systemProduct = Get-CimInstance Win32_ComputerSystemProduct -ErrorAction Stop |
-            Select-Object -First 1
-        $uuid = ConvertTo-WPCTNormalizedHardwareValue -Value $systemProduct.UUID -Type SmbiosUuid
-    }
-    catch {
-        Write-Verbose "SMBIOS UUID is unavailable: $($_.Exception.Message)"
+    for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
+        try {
+            $systemProduct = Get-CimInstance Win32_ComputerSystemProduct -ErrorAction Stop |
+                Select-Object -First 1
+            if ($null -ne $systemProduct) {
+                $uuid = ConvertTo-WPCTNormalizedHardwareValue -Value $systemProduct.UUID -Type SmbiosUuid
+            }
+            break
+        }
+        catch {
+            if ($attempt -lt $MaxAttempts) {
+                if ($RetryDelayMilliseconds -gt 0) {
+                    Start-Sleep -Milliseconds $RetryDelayMilliseconds
+                }
+            }
+            else {
+                Write-Verbose "SMBIOS UUID is unavailable after $MaxAttempts attempts: $($_.Exception.Message)"
+            }
+        }
     }
 
     $fields = New-Object System.Collections.Generic.List[string]
@@ -456,17 +610,54 @@ function Unprotect-WPCTBytes {
 #region Payload validation
 
 function ConvertTo-WPCTSerializableSecrets {
-    param([Parameter(Mandatory=$true)][array]$Secrets)
-    $out=New-Object System.Collections.Generic.List[object];$seen=@{}
-    foreach($secret in $Secrets){
-        $id=[string]$secret.Id;if([string]::IsNullOrWhiteSpace($id)-or$id-notmatch'^[A-Za-z0-9._-]+$'){throw "Invalid secret Id: $id"};if($seen.ContainsKey($id)){throw "Duplicate secret Id: $id"};$seen[$id]=$true
-        if($null-ne $secret.Credential){
-            if($secret.Credential-isnot[Management.Automation.PSCredential]){throw "Credential for '$id' is not a PSCredential."}
-            $nc=$secret.Credential.GetNetworkCredential();try{$out.Add([pscustomobject]@{Id=$id;Type='PSCredential';Username=$secret.Credential.UserName;Password=$nc.Password})}finally{$nc=$null}
-        }else{
-            if([string]$secret.Type-ne'PSCredential'){throw "Unsupported secret type for '$id'."}
-            if([string]::IsNullOrWhiteSpace([string]$secret.Username)-or$null-eq$secret.Password){throw "Username or password missing for '$id'."}
-            $out.Add([pscustomobject]@{Id=$id;Type='PSCredential';Username=[string]$secret.Username;Password=[string]$secret.Password})
+    param([Parameter(Mandatory = $true)][array]$Secrets)
+    $out = New-Object System.Collections.Generic.List[object]
+    $seen = @{}
+    foreach ($secret in $Secrets) {
+        $id = [string]$secret.Id
+        if ([string]::IsNullOrWhiteSpace($id) -or $id -notmatch '^[A-Za-z0-9._-]+$') {
+            throw "Invalid secret Id: $id"
+        }
+        if ($seen.ContainsKey($id)) {
+            throw "Duplicate secret Id: $id"
+        }
+        $seen[$id] = $true
+        if ($null -ne $secret.Credential) {
+            if ($secret.Credential -isnot [Management.Automation.PSCredential]) {
+                throw "Credential for '$id' is not a PSCredential."
+            }
+            $bstr = [IntPtr]::Zero
+            $plainPassword = $null
+            try {
+                $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secret.Credential.Password)
+                $plainPassword = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr)
+                $out.Add([pscustomobject]@{
+                    Id       = $id
+                    Type     = 'PSCredential'
+                    Username = $secret.Credential.UserName
+                    Password = $plainPassword
+                })
+            }
+            finally {
+                if ($bstr -ne [IntPtr]::Zero) {
+                    [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr)
+                }
+                $plainPassword = $null
+            }
+        }
+        else {
+            if ([string]$secret.Type -ne 'PSCredential') {
+                throw "Unsupported secret type for '$id'."
+            }
+            if ([string]::IsNullOrWhiteSpace([string]$secret.Username) -or $null -eq $secret.Password) {
+                throw "Username or password missing for '$id'."
+            }
+            $out.Add([pscustomobject]@{
+                Id       = $id
+                Type     = 'PSCredential'
+                Username = [string]$secret.Username
+                Password = [string]$secret.Password
+            })
         }
     }
     $out.ToArray()
@@ -558,7 +749,7 @@ function Dismount-WPCTOfflineSoftwareHive {
 }
 
 function Set-WPCTRegistryKeyAcl {
-    <# Restricts the bootstrap key to Local SYSTEM and local Administrators. #>
+    <# Restricts the bootstrap key to Local SYSTEM and local Administrators, applying the DACL before best-effort owner assignment. #>
     [CmdletBinding()]
     param([Parameter(Mandatory=$true)][string]$RegistryPath)
 
@@ -584,12 +775,18 @@ function Set-WPCTRegistryKeyAcl {
         $acl.AddAccessRule($rule)
     }
 
-    $acl.SetOwner($adminsSid)
     Set-Acl -Path $RegistryPath -AclObject $acl -ErrorAction Stop
+    try {
+        $acl.SetOwner($adminsSid)
+        Set-Acl -Path $RegistryPath -AclObject $acl -ErrorAction Stop
+    }
+    catch {
+        Write-Verbose "Best-effort registry key owner assignment skipped for '$RegistryPath': $($_.Exception.Message)"
+    }
 }
 
 function Set-WPCTFileAcl {
-    <# Restricts a file to Local SYSTEM and local Administrators. #>
+    <# Restricts a file to Local SYSTEM and local Administrators, applying the DACL before best-effort owner assignment. #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
@@ -601,12 +798,18 @@ function Set-WPCTFileAcl {
     $adminsSid = New-Object Security.Principal.SecurityIdentifier('S-1-5-32-544')
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($systemSid, $full, $allow)))
     $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($adminsSid, $full, $allow)))
-    $acl.SetOwner($adminsSid)
     Set-Acl -LiteralPath $LiteralPath -AclObject $acl -ErrorAction Stop
+    try {
+        $acl.SetOwner($adminsSid)
+        Set-Acl -LiteralPath $LiteralPath -AclObject $acl -ErrorAction Stop
+    }
+    catch {
+        Write-Verbose "Best-effort file owner assignment skipped for '$LiteralPath': $($_.Exception.Message)"
+    }
 }
 
 function Set-WPCTCredentialDirectoryAcl {
-    <# Restricts CLIXML output to its creator, SYSTEM, and Administrators. #>
+    <# Restricts CLIXML output to its creator, SYSTEM, and Administrators, applying the DACL before best-effort owner assignment. #>
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)][string]$LiteralPath)
 
@@ -626,8 +829,14 @@ function Set-WPCTCredentialDirectoryAcl {
         )
         $acl.AddAccessRule($rule)
     }
-    $acl.SetOwner($currentSid)
     Set-Acl -LiteralPath $LiteralPath -AclObject $acl -ErrorAction Stop
+    try {
+        $acl.SetOwner($currentSid)
+        Set-Acl -LiteralPath $LiteralPath -AclObject $acl -ErrorAction Stop
+    }
+    catch {
+        Write-Verbose "Best-effort directory owner assignment skipped for '$LiteralPath': $($_.Exception.Message)"
+    }
 }
 
 function New-WPCTRegistryTransferKey {
@@ -650,8 +859,25 @@ function New-WPCTRegistryTransferKey {
         throw "Refusing to create a registry transfer key over an existing key: $RegistryPath"
     }
 
+    $missingParents = New-Object System.Collections.Generic.List[string]
+    $cursor = Split-Path -Parent $RegistryPath
+    while (-not [string]::IsNullOrWhiteSpace($cursor) -and -not (Test-Path -Path $cursor)) {
+        $missingParents.Add($cursor)
+        $nextParent = Split-Path -Parent $cursor
+        if ([string]::IsNullOrWhiteSpace($nextParent) -or $nextParent -eq $cursor) {
+            break
+        }
+        $cursor = $nextParent
+    }
+    $missingParents.Reverse()
+
     New-Item -Path $RegistryPath -Force -ErrorAction Stop | Out-Null
     try {
+        foreach ($createdParent in $missingParents) {
+            if (Test-Path -Path $createdParent) {
+                Set-WPCTRegistryKeyAcl -RegistryPath $createdParent
+            }
+        }
         Set-WPCTRegistryKeyAcl -RegistryPath $RegistryPath
         New-ItemProperty `
             -Path $RegistryPath `
@@ -836,6 +1062,7 @@ function New-WPCTCredentialTransfer {
         [string[]]$RequiredSecretIds=@(),
         [object]$MachineIdentity=$null,
         [switch]$AllowOverwrite,
+        [switch]$AllowUnsafeLogging,
         [ValidateRange(1024, 104857600)][int64]$MaximumPackageBytes=$script:WPCTDefaults.MaximumPackageBytes
     )
 
@@ -861,6 +1088,7 @@ function New-WPCTCredentialTransfer {
     $commitCompleted = $false
 
     try {
+        Assert-WPCTSafeLogging -AllowUnsafeLogging:$AllowUnsafeLogging | Out-Null
         $RegistrySubKey = Resolve-WPCTRegistrySubKey $RegistrySubKey
         $regPath = Join-Path $OfflineRegistryRoot $RegistrySubKey
         $SecretFilePath = Assert-WPCTPathHasNoReparsePoint -LiteralPath $SecretFilePath
@@ -929,8 +1157,13 @@ function New-WPCTCredentialTransfer {
 
         $parent = Split-Path -Parent $SecretFilePath
         if (-not [string]::IsNullOrWhiteSpace($parent)) {
+            $parentExisted = Test-Path -LiteralPath $parent -PathType Container
             New-Item -ItemType Directory -Path $parent -Force -ErrorAction Stop | Out-Null
             Assert-WPCTPathHasNoReparsePoint -LiteralPath $parent | Out-Null
+            $parentLeaf = Split-Path -Leaf $parent
+            if (-not $parentExisted -or $parentLeaf -match '^(?i)(Credentials?|Secrets?|WPCT)$') {
+                Set-WPCTCredentialDirectoryAcl -LiteralPath $parent
+            }
         }
 
         $plain=[Text.Encoding]::UTF8.GetBytes(($payload|ConvertTo-Json -Depth 12 -Compress))
@@ -1190,11 +1423,7 @@ function New-WPCTCredentialTransfer {
             ) { $temporaryPath } else { $null }
         }) $errorMessage
     } finally {
-        foreach ($secret in @($serializable)) {
-            if ($null -ne $secret.PSObject.Properties['Password']) {
-                $secret.Password = $null
-            }
-        }
+        Clear-WPCTPayloadSecrets -Payload $serializable
         $payload = $null
         $serializable = @()
         Clear-WPCTByteArray $random
@@ -1214,6 +1443,7 @@ function Read-WPCTCredentialTransfer {
         [string]$RegistrySubKey=$script:WPCTDefaults.RegistrySubKey,
         [string[]]$RequiredSecretIds=@(),
         [object]$MachineIdentity=$null,
+        [switch]$AllowUnsafeLogging,
         [ValidateRange(1024, 104857600)][int64]$MaximumPackageBytes=$script:WPCTDefaults.MaximumPackageBytes
     )
 
@@ -1224,6 +1454,7 @@ function Read-WPCTCredentialTransfer {
     $json = $null
 
     try {
+        Assert-WPCTSafeLogging -AllowUnsafeLogging:$AllowUnsafeLogging | Out-Null
         $RegistrySubKey = Resolve-WPCTRegistrySubKey $RegistrySubKey
         if (-not (Test-Path -LiteralPath $SecretFilePath -PathType Leaf)) {
             throw "Secret package not found: $SecretFilePath"
@@ -1283,6 +1514,16 @@ function Read-WPCTCredentialTransfer {
             throw 'Authenticated binding fields do not match registry metadata.'
         }
 
+        foreach ($secret in @($payload.Secrets)) {
+            $securePassword = ConvertTo-SecureString ([string]$secret.Password) -AsPlainText -Force
+            $credentialObj = New-Object Management.Automation.PSCredential(
+                [string]$secret.Username,
+                $securePassword
+            )
+            $secret | Add-Member -NotePropertyName 'SecurePassword' -NotePropertyValue $securePassword -Force
+            $secret | Add-Member -NotePropertyName 'Credential' -NotePropertyValue $credentialObj -Force
+        }
+
         New-WPCTResult $true $payload
     }
     catch {
@@ -1310,7 +1551,8 @@ function Export-WPCTCredentialClixml {
     param(
         [Parameter(Mandatory=$true)]$Payload,
         [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string]$OutputDirectory,
-        [switch]$AllowOverwrite
+        [switch]$AllowOverwrite,
+        [switch]$AllowUnsafeLogging
     )
 
     $transactionId = [guid]::NewGuid().ToString('N')
@@ -1322,6 +1564,7 @@ function Export-WPCTCredentialClixml {
     $commitCompleted = $false
 
     try {
+        Assert-WPCTSafeLogging -AllowUnsafeLogging:$AllowUnsafeLogging | Out-Null
         $OutputDirectory = Assert-WPCTPathHasNoReparsePoint -LiteralPath $OutputDirectory
         $parent = Split-Path -Parent $OutputDirectory
         if ([string]::IsNullOrWhiteSpace($parent)) {
@@ -1331,6 +1574,7 @@ function Export-WPCTCredentialClixml {
         $backupDirectory = Join-Path $parent ".wpct-backup-$transactionId"
 
         New-Item -ItemType Directory -Path $stagingDirectory -ErrorAction Stop | Out-Null
+        Assert-WPCTPathHasNoReparsePoint -LiteralPath $stagingDirectory | Out-Null
         Set-WPCTCredentialDirectoryAcl -LiteralPath $stagingDirectory
 
         foreach ($secret in @($Payload.Secrets)) {
@@ -1339,11 +1583,19 @@ function Export-WPCTCredentialClixml {
                 throw "Credential file already exists. Use -AllowOverwrite to replace it: $destinationPath"
             }
 
-            $secure = ConvertTo-SecureString ([string]$secret.Password) -AsPlainText -Force
-            $credential = New-Object Management.Automation.PSCredential(
-                [string]$secret.Username,
-                $secure
-            )
+            $credential = if (
+                $null -ne $secret.PSObject.Properties['Credential'] -and
+                $secret.Credential -is [Management.Automation.PSCredential]
+            ) {
+                $secret.Credential
+            }
+            else {
+                $secure = ConvertTo-SecureString ([string]$secret.Password) -AsPlainText -Force
+                New-Object Management.Automation.PSCredential(
+                    [string]$secret.Username,
+                    $secure
+                )
+            }
             $stagedPath = Join-Path $stagingDirectory ($secret.Id + '.xml')
             $credential | Export-Clixml -LiteralPath $stagedPath -Force -ErrorAction Stop
             $verify = Import-Clixml -LiteralPath $stagedPath -ErrorAction Stop
@@ -1360,10 +1612,12 @@ function Export-WPCTCredentialClixml {
         }
 
         New-Item -ItemType Directory -Path $OutputDirectory -Force -ErrorAction Stop | Out-Null
+        Assert-WPCTPathHasNoReparsePoint -LiteralPath $OutputDirectory | Out-Null
         Set-WPCTCredentialDirectoryAcl -LiteralPath $OutputDirectory
 
         if ($AllowOverwrite) {
             New-Item -ItemType Directory -Path $backupDirectory -ErrorAction Stop | Out-Null
+            Assert-WPCTPathHasNoReparsePoint -LiteralPath $backupDirectory | Out-Null
             Set-WPCTCredentialDirectoryAcl -LiteralPath $backupDirectory
         }
 
@@ -1553,11 +1807,7 @@ function Export-WPCTCredentialClixml {
         }) $errorMessage
     }
     finally {
-        foreach ($secret in @($Payload.Secrets)) {
-            if ($null -ne $secret.PSObject.Properties['Password']) {
-                $secret.Password = $null
-            }
-        }
+        Clear-WPCTPayloadSecrets -Payload $Payload
     }
 }
 
@@ -1574,6 +1824,8 @@ function Remove-WPCTCredentialTransfer {
             return $true
         })]
         [guid]$TransferId,
+
+        [switch]$AllowUnsafeLogging,
 
         [ValidateRange(1024, 104857600)]
         [int64]$MaximumPackageBytes = $script:WPCTDefaults.MaximumPackageBytes
@@ -1599,6 +1851,7 @@ function Remove-WPCTCredentialTransfer {
         $read = Read-WPCTCredentialTransfer `
             -SecretFilePath $SecretFilePath `
             -RegistrySubKey $RegistrySubKey `
+            -AllowUnsafeLogging:$AllowUnsafeLogging `
             -MaximumPackageBytes $MaximumPackageBytes
         if (-not $read.Success) {
             throw "Refusing cleanup because package ownership could not be authenticated: $($read.Error)"
@@ -1652,13 +1905,7 @@ function Remove-WPCTCredentialTransfer {
         }) $_.Exception.Message
     }
     finally {
-        if ($null -ne $authenticatedPayload) {
-            foreach ($secret in @($authenticatedPayload.Secrets)) {
-                if ($null -ne $secret.PSObject.Properties['Password']) {
-                    $secret.Password = $null
-                }
-            }
-        }
+        Clear-WPCTPayloadSecrets -Payload $authenticatedPayload
     }
 }
 
@@ -1672,47 +1919,66 @@ function Invoke-WPCTCredentialImport {
         [string[]]$RequiredSecretIds=@(),
         [switch]$KeepTransfer,
         [switch]$AllowClixmlOverwrite,
+        [switch]$AllowUnsafeLogging,
         [ValidateRange(1024, 104857600)][int64]$MaximumPackageBytes=$script:WPCTDefaults.MaximumPackageBytes
     )
 
-    $read = Read-WPCTCredentialTransfer `
-        -SecretFilePath $SecretFilePath `
-        -RegistrySubKey $RegistrySubKey `
-        -RequiredSecretIds $RequiredSecretIds `
-        -MaximumPackageBytes $MaximumPackageBytes
-    if (-not $read.Success) {
-        return $read
+    try {
+        Assert-WPCTSafeLogging -AllowUnsafeLogging:$AllowUnsafeLogging | Out-Null
+    }
+    catch {
+        return (New-WPCTResult $false $null $_.Exception.Message)
     }
 
-    $transferId = [guid]$read.Payload.TransferId
-    $export = Export-WPCTCredentialClixml `
-        -Payload $read.Payload `
-        -OutputDirectory $OutputDirectory `
-        -AllowOverwrite:$AllowClixmlOverwrite
-    if (-not $export.Success) {
-        return $export
-    }
-
-    $cleanup = $null
-    if (-not $KeepTransfer) {
-        $cleanup = Remove-WPCTCredentialTransfer `
+    $read = $null
+    try {
+        $read = Read-WPCTCredentialTransfer `
             -SecretFilePath $SecretFilePath `
             -RegistrySubKey $RegistrySubKey `
-            -TransferId $transferId `
+            -RequiredSecretIds $RequiredSecretIds `
+            -AllowUnsafeLogging:$AllowUnsafeLogging `
             -MaximumPackageBytes $MaximumPackageBytes
-        if (-not $cleanup.Success) {
-            return $cleanup
+        if (-not $read.Success) {
+            return $read
+        }
+
+        $transferId = [guid]$read.Payload.TransferId
+        $export = Export-WPCTCredentialClixml `
+            -Payload $read.Payload `
+            -OutputDirectory $OutputDirectory `
+            -AllowOverwrite:$AllowClixmlOverwrite `
+            -AllowUnsafeLogging:$AllowUnsafeLogging
+        if (-not $export.Success) {
+            return $export
+        }
+
+        $cleanup = $null
+        if (-not $KeepTransfer) {
+            $cleanup = Remove-WPCTCredentialTransfer `
+                -SecretFilePath $SecretFilePath `
+                -RegistrySubKey $RegistrySubKey `
+                -TransferId $transferId `
+                -AllowUnsafeLogging:$AllowUnsafeLogging `
+                -MaximumPackageBytes $MaximumPackageBytes
+            if (-not $cleanup.Success) {
+                return $cleanup
+            }
+        }
+
+        return (New-WPCTResult $true ([pscustomobject]@{
+            EngineVersion = $script:WPCTEngineVersion
+            TransferId = $transferId.ToString('D')
+            ClixmlFiles = $export.Payload.ClixmlFiles
+            CreatedFor = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+            CleanedUp = (-not $KeepTransfer)
+            Cleanup = if ($null -eq $cleanup) { $null } else { $cleanup.Payload }
+        }))
+    }
+    finally {
+        if ($null -ne $read -and $null -ne $read.Payload) {
+            Clear-WPCTPayloadSecrets -Payload $read.Payload
         }
     }
-
-    New-WPCTResult $true ([pscustomobject]@{
-        EngineVersion = $script:WPCTEngineVersion
-        TransferId = $transferId.ToString('D')
-        ClixmlFiles = $export.Payload.ClixmlFiles
-        CreatedFor = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        CleanedUp = (-not $KeepTransfer)
-        Cleanup = if ($null -eq $cleanup) { $null } else { $cleanup.Payload }
-    })
 }
 
 #endregion Credential transfer workflow
